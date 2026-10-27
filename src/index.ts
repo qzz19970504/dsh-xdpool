@@ -1343,85 +1343,70 @@ function canonicalJson(value: unknown): string {
      * nothing to offer" would otherwise be drawn identically, and the user has
      * no way to tell which one they are looking at.
      */
-    channelModels: async (
-      providers: readonly string[],
-      hints?: Readonly<Record<string, readonly string[]>>,
-    ): Promise<Readonly<Record<string, readonly PoolWebChannelModel[]>>> => {
-      const models: Record<string, readonly PoolWebChannelModel[]> = {}
-      // Six at a time rather than all at once: some adapters resolve a model by
-      // asking their upstream, and a channel publishing thirty models would
-      // otherwise open thirty sockets to answer a card nobody is looking at yet.
-      const resolveConcurrency = 6
-      for (const provider of providers) {
-        try {
-          /*
-            The id list comes from the caller when it has one.
-            
-            `llm.listModels` is the obvious source and it is the wrong one here:
-            it sits behind the pack's credential gate, so a channel the host
-            considers invisible answers `[]` even while its card is on screen
-            showing nine models. That is exactly how every channel row ended up
-            with no window and "text only" — the facts were resolvable, there was
-            simply nothing to resolve them for. The caller has just rendered the
-            ids from `model.list` (which does not pass that gate), so its list is
-            authoritative about *which* models exist; this route only adds what
-            each one is.
-          */
-          const hinted = hints?.[provider]
-          const rows: readonly { id: string, name: string, description?: string, inputModalities?: readonly string[] }[] =
-            hinted !== undefined && hinted.length > 0
-              ? hinted.map(id => ({ id, name: id }))
-              : await ctx.llm.listModels(provider)
-          const resolved = new Map<string, PoolWebChannelModel>()
-          let next = 0
-          const workers = Array.from({ length: Math.min(resolveConcurrency, rows.length) }, async () => {
-            while (next < rows.length) {
-              const row = rows[next++]
-              // Read the id out first: a shared cursor under
-              // `noUncheckedIndexedAccess` is typed as possibly absent even
-              // though the bound check above proves it, and every later use of
-              // the row would carry that doubt.
-              if (row === undefined) continue
-              let extra: Partial<PoolWebChannelModel> = {}
-              try {
-                const info = await ctx.llm.resolveModelInfo(provider, row.id)
-                extra = {
-                  ...info.context?.contextWindow === undefined
-                    ? {}
-                    : { contextWindow: info.context.contextWindow },
-                  ...info.defaultMaxTokens === undefined ? {} : { maxTokens: info.defaultMaxTokens },
-                  ...info.inputModalities === undefined ? {} : { inputModalities: info.inputModalities },
+    channelModels: (() => {
+      const channelModelFactsCache = new Map<string, Partial<PoolWebChannelModel>>()
+      return async (
+        providers: readonly string[],
+        hints?: Readonly<Record<string, readonly string[]>>,
+      ): Promise<Readonly<Record<string, readonly PoolWebChannelModel[]>>> => {
+        const models: Record<string, readonly PoolWebChannelModel[]> = {}
+        // Six at a time rather than all at once: some adapters resolve a model by
+        // asking their upstream, and a channel publishing thirty models would
+        // otherwise open thirty sockets to answer a card nobody is looking at yet.
+        const resolveConcurrency = 6
+        for (const provider of providers) {
+          try {
+            const hinted = hints?.[provider]
+            const rows: readonly { id: string, name: string, description?: string, inputModalities?: readonly string[] }[] =
+              hinted !== undefined && hinted.length > 0
+                ? hinted.map(id => ({ id, name: id }))
+                : await ctx.llm.listModels(provider)
+            const resolved = new Map<string, PoolWebChannelModel>()
+            let next = 0
+            const workers = Array.from({ length: Math.min(resolveConcurrency, rows.length) }, async () => {
+              while (next < rows.length) {
+                const row = rows[next++]
+                if (row === undefined) continue
+                let extra: Partial<PoolWebChannelModel> = {}
+                const cacheKey = `${provider}/${row.id}`
+                const cached = channelModelFactsCache.get(cacheKey)
+                if (cached !== undefined) {
+                  extra = cached
+                } else {
+                  try {
+                    const info = await ctx.llm.resolveModelInfo(provider, row.id)
+                    extra = {
+                      ...info.context?.contextWindow === undefined
+                        ? {}
+                        : { contextWindow: info.context.contextWindow },
+                      ...info.defaultMaxTokens === undefined ? {} : { maxTokens: info.defaultMaxTokens },
+                      ...info.inputModalities === undefined ? {} : { inputModalities: info.inputModalities },
+                    }
+                    channelModelFactsCache.set(cacheKey, extra)
+                  } catch (cause: unknown) {
+                    void cause
+                  }
                 }
-              } catch (cause: unknown) {
-                // An adapter that cannot describe one exact model is the norm
-                // for the channels whose catalogue is a bare id list, and the
-                // row stays printable without it — the host's own model picker
-                // renders the same row with no figures.
-                void cause
+                resolved.set(row.id, {
+                  id: row.id,
+                  name: row.name,
+                  ...row.description === undefined ? {} : { description: row.description },
+                  ...row.inputModalities === undefined ? {} : { inputModalities: row.inputModalities },
+                  ...extra,
+                })
               }
-              resolved.set(row.id, {
-                id: row.id,
-                // A hinted row has no name of its own; the caller keeps the one
-                // it rendered, and the id is the honest stand-in here.
-                name: row.name,
-                ...row.description === undefined ? {} : { description: row.description },
-                ...row.inputModalities === undefined ? {} : { inputModalities: row.inputModalities },
-                ...extra,
-              })
-            }
-          })
-          await Promise.all(workers)
-          models[provider] = rows
-            .map(row => resolved.get(row.id))
-            .filter((row): row is PoolWebChannelModel => row !== undefined)
-        } catch {
-          // No adapter, or the adapter refused to list. Either way the answer is
-          // "nothing to show for this one", and the page draws no model row for
-          // it — which is what an unsignable channel looks like anyway.
+            })
+            await Promise.all(workers)
+            models[provider] = rows
+              .map(row => resolved.get(row.id))
+              .filter((row): row is PoolWebChannelModel => row !== undefined)
+          } catch {
+            // ignore
+          }
         }
+        return models
       }
-      return models
-    },
+    })(),
     discoverAggregate: async (providerId: string): Promise<PoolWebAggregateProbe> => {
       const store = readAggregateSettingsSync()
       const probe = await probeAggregateProvider(store, providerId)
