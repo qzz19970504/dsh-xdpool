@@ -125,32 +125,14 @@ interface ChannelEntry {
 }
 
 /**
- * Collapse repeated sign-ins of the same person into one row.
- *
- * The pack's `account.create` appends unconditionally — it has no idea an
- * account with the same nickname already exists — so clicking "add account"
- * twice leaves two entries. The pack prunes them on disk, but the prune only
- * runs at mount and on the next login, so a card can still render the
- * pre-prune list. Same provider plus same nickname is the same person (the
- * pack rewrites the nickname from a random id to the real display name the
- * moment a login lands), so the newest entry wins: it is the one whose
- * credential was written last.
+ * Collapse repeated accounts by id.
  */
 function dedupeAccounts(accounts: readonly ChannelAccount[]): readonly ChannelAccount[] {
-  const byNickname = new Map<string, ChannelAccount>()
-  const order: string[] = []
+  const byId = new Map<string, ChannelAccount>()
   for (const account of accounts) {
-    const nickname = (account.nickname ?? '').trim()
-    const key = nickname === '' ? `id:${account.id}` : `n:${nickname}`
-    const kept = byNickname.get(key)
-    if (kept === undefined) {
-      byNickname.set(key, account)
-      order.push(key)
-      continue
-    }
-    byNickname.set(key, account)
+    byId.set(account.id, account)
   }
-  return order.map(key => byNickname.get(key)).filter((account): account is ChannelAccount => account !== undefined)
+  return [...byId.values()]
 }
 
 /** A refusal shaped like the pack's own envelope, so one catch covers both. */
@@ -191,10 +173,20 @@ function amount(value: number): string {
   return Number.isInteger(value) ? String(value) : value.toFixed(2)
 }
 
+/** Retained across unmounts so entering from sidebar never flashes blank or delays cards. */
+let channelEntriesMemoryCache: readonly ChannelEntry[] = []
+
 export function ChannelPoolSection({ t }: { readonly t?: Translate | undefined }): ReactElement {
-  const [entries, setEntries] = useState<readonly ChannelEntry[]>([])
+  const [entries, setEntries] = useState<readonly ChannelEntry[]>(() => channelEntriesMemoryCache)
   const [error, setError] = useState<string | undefined>(undefined)
   const [notice, setNotice] = useState<string | undefined>(undefined)
+  /**
+   * True once the retries are spent with no cards.
+   *
+   * "Loaded and empty" is not "loading": a cold mount and a pool with no scan
+   * accounts both render zero cards, and only one of them is still working.
+   */
+  const [settled, setSettled] = useState(false)
   /** provider → the open list, or `undefined` for a card with both folded. */
   const [folds, setFolds] = useState<ReadonlyMap<string, Fold | undefined>>(new Map())
   /** provider → the set of model ids the user has ticked. */
@@ -206,7 +198,17 @@ export function ChannelPoolSection({ t }: { readonly t?: Translate | undefined }
   const entriesRef = useRef(entries)
   entriesRef.current = entries
   const mountedRef = useRef(true)
-  useEffect(() => () => { mountedRef.current = false }, [])
+  useEffect(() => {
+    // Re-arm on every setup. StrictMode mounts every effect as
+    // setup → cleanup → setup; a ref that is only ever cleared in the cleanup
+    // stays false for the rest of the session, and every state write a finished
+    // load makes is then dropped — which renders as a permanent "loading" line
+    // with no error.
+    mountedRef.current = true
+    return () => {
+      mountedRef.current = false
+    }
+  }, [])
 
   const markBusy = (provider: string, on: boolean): void => {
     setBusy(previous => {
@@ -233,58 +235,32 @@ export function ChannelPoolSection({ t }: { readonly t?: Translate | undefined }
       const scanProviders = channels
         .map(channel => channel.id)
         .filter(id => (statuses.get(id)?.accountsTotal ?? 0) > 0)
-      // Facts are fetched AFTER the model lists below, not before: the host's
-      // own listing is gated per provider, and a gated channel answers "no
-      // models" even while its card shows nine. The ids this page just rendered
-      // are the authoritative set, so they are handed back to the host as a
-      // hint — see `PoolWebChannelModelsRequest.ids`.
+      // Phase 1 waits for ONE call per channel: its account rows. Everything
+      // else — model catalogues, balances, check-in state, host facts — is
+      // enrichment that runs after the cards exist.
+      //
+      // `model.list` must NOT be here. For most channels it is an in-memory
+      // read, but cline's resolves its remote catalogue (models.dev plus the
+      // vendor endpoint, 20 s timeout each) and was measured still in flight at
+      // 24 s; awaiting it meant no card rendered at all for over a minute,
+      // which reads exactly like "this page never loads".
       const perProvider = await Promise.all(scanProviders.map(async provider => {
         const wantBalances = channels.find(channel => channel.id === provider)?.credits !== undefined
-        // The calls are independent: a channel whose catalogue cannot be
-        // listed still has accounts worth showing, so one failure must not
-        // blank the other half of the card.
-        const accountsPromise = callPack('account.list', { provider })
-        const modelsPromise = callPack('model.list', { provider })
-        const balancesPromise = wantBalances
-          ? callPack('credits.balances', { provider })
-          : Promise.resolve(undefined)
-        const statusesPromise = wantBalances && channels.find(c => c.id === provider)?.credits?.status === true
-          ? callPack('credits.status', { provider })
-          : Promise.resolve(undefined)
-        // `callPack` answers an `ok: false` envelope as a value rather than a
-        // rejection, so the catch arms only cover the transport itself.
-        const [accounts, models, balances, creditStatuses] = await Promise.all([
-          accountsPromise.catch(() => refused('account.list failed')),
-          modelsPromise.catch(() => refused('model.list failed')),
-          balancesPromise.catch(() => refused('credits.balances failed')),
-          statusesPromise.catch(() => refused('credits.status failed')),
-        ])
-        // `model.list` answers with a FLAT array for the one provider it was
-        // asked about (`{models: [...]}`), not a provider→rows map, so it is
-        // read with modelsFrom — reading it as a map found no key for this
-        // provider and rendered an empty list under a plausible "no models
-        // published" line.
-        const modelRows = modelsFrom(models.value)
-        const modelEmptyBecauseRefused = modelRows.length === 0 && models.ok !== true
-        const balanceRows = balances === undefined ? [] : balancesFrom(balances)
+        const accounts = await callPack('account.list', { provider })
+          .catch(() => refused('account.list failed'))
         return [
           provider,
           {
             accounts: dedupeAccounts(accountsFrom(accounts)),
-            // Sorted at read time so the order survives every re-load: the pack
-            // returns each vendor's own chronology, which is not the order a
-            // reader answers "which one do I pick?" in.
-            models: sortChannelModels(modelRows),
+            // Model rows are filled by Phase 2: the card is already useful
+            // without them, and one slow catalogue must not hold the others.
+            models: [] as readonly ChannelModel[],
             facts: new Map<string, PoolWebChannelModel>(),
-            balances: balanceRows,
-            statuses: creditStatuses === undefined ? [] : creditStatusesFrom(creditStatuses),
-            balancePending: false,
-            balanceError: balances !== undefined && !balances.ok && balanceRows.length === 0
-              ? (balances.error?.message ?? 'credits.balances refused')
-              : undefined,
-            modelError: modelEmptyBecauseRefused
-              ? (models.error?.message ?? 'model.list refused')
-              : undefined,
+            balances: [] as readonly ChannelBalance[],
+            statuses: [] as readonly ChannelCreditStatus[],
+            balancePending: wantBalances,
+            balanceError: undefined as string | undefined,
+            modelError: undefined as string | undefined,
           },
         ] as const
       }))
@@ -299,39 +275,95 @@ export function ChannelPoolSection({ t }: { readonly t?: Translate | undefined }
         }))
       if (!mountedRef.current) return
 
-      // Two phases, because the two halves answer at very different speeds.
-      // `provider.status` and `account.list` come back in tens of milliseconds,
-      // while the fact sweep (`/channels/models`, which resolves every model
-      // against the host's adapters) measured 16.5 seconds on a cold host. Doing
-      // that before `setEntries` kept every card blank for the whole sweep, which
-      // reads as "the pool did not load at all". So the cards land first and the
-      // facts are merged in when they arrive.
+      // Two phases: Phase 1 renders all available channel cards immediately.
+      // Balances, credit statuses, model catalogues and fact descriptors are
+      // enriched per provider asynchronously in Phase 2 so slow remote requests
+      // cannot gate the cards.
+      channelEntriesMemoryCache = next
       setEntries(next)
       setError(undefined)
 
       if (next.length === 0) {
-        // Nothing to enrich, and the empty page would otherwise be silent. A
-        // statuses answer that named providers but counted zero accounts is a
-        // real "no sign-ins"; an answer that came back refused is not, and must
-        // say so or the reader cannot tell the two apart.
         if (!statusAnswer.ok) {
           setError(statusAnswer.error?.message ?? 'provider.status refused')
         }
         return
       }
 
-      const idsByProvider: Record<string, readonly string[]> = {}
-      for (const [provider, entry] of perProvider) {
-        if (entry.models.length > 0) idsByProvider[provider] = entry.models.map(model => model.id)
+      // Phase 2: Enrich each provider independently in the background.
+      const updateProvider = (provider: string, patch: Partial<ChannelEntry>): void => {
+        if (!mountedRef.current) return
+        setEntries(previous => {
+          const updated = previous.map(entry =>
+            entry.channel.id === provider ? { ...entry, ...patch } : entry
+          )
+          channelEntriesMemoryCache = updated
+          return updated
+        })
       }
-      const facts = await fetchChannelModels(next.map(entry => entry.channel.id), idsByProvider)
-        .catch((): ReadonlyMap<string, readonly PoolWebChannelModel[]> => new Map())
-      if (!mountedRef.current) return
-      if (facts.size === 0) return
-      setEntries(previous => previous.map(entry => ({
-        ...entry,
-        facts: new Map((facts.get(entry.channel.id) ?? []).map(model => [model.id, model])),
-      })))
+
+      for (const entry of next) {
+        const provider = entry.channel.id
+        // Model catalogue first, because the host facts below are keyed by the
+        // ids it returns. `model.list` answers a FLAT array for the one
+        // provider it was asked about (`{models: [...]}`), not a provider→rows
+        // map, so it is read with modelsFrom — reading it as a map found no key
+        // for this provider and rendered an empty list under a plausible
+        // "no models published" line. A refusal is surfaced on the card rather
+        // than folded into "no models", so a host without the `llm` service
+        // does not look like an empty catalogue.
+        void callPack('model.list', { provider })
+          .catch(() => refused('model.list failed'))
+          .then(answer => {
+            // Sorted at read time so the order survives every re-load: the pack
+            // returns each vendor's own chronology, which is not the order a
+            // reader answers "which one do I pick?" in.
+            const modelRows = sortChannelModels(modelsFrom(answer.value))
+            updateProvider(provider, {
+              models: modelRows,
+              modelError: modelRows.length === 0 && answer.ok !== true
+                ? (answer.error?.message ?? 'model.list refused')
+                : undefined,
+            })
+            const ids = modelRows.map(model => model.id)
+            // Facts are fetched AFTER the model list, not before: the host's
+            // own listing is gated per provider, and a gated channel answers
+            // "no models" even while its card shows nine. The ids the card just
+            // got are the authoritative set, so they are handed back to the
+            // host as a hint — see `PoolWebChannelModelsRequest.ids`.
+            void fetchChannelModels([provider], ids.length > 0 ? { [provider]: ids } : {})
+              .catch((): ReadonlyMap<string, readonly PoolWebChannelModel[]> => new Map())
+              .then(facts => {
+                if (!facts.has(provider)) return
+                updateProvider(provider, {
+                  facts: new Map((facts.get(provider) ?? []).map(model => [model.id, model])),
+                })
+              })
+          })
+        if (entry.channel.credits !== undefined) {
+          void callPack('credits.balances', { provider })
+            .catch(() => refused('credits.balances failed'))
+            .then(answer => {
+              const balances = balancesFrom(answer)
+              updateProvider(provider, {
+                balances,
+                balancePending: false,
+                balanceError: !answer.ok && balances.length === 0
+                  ? (answer.error?.message ?? 'credits.balances refused')
+                  : undefined,
+              })
+            })
+          if (entry.channel.credits.status === true) {
+            void callPack('credits.status', { provider })
+              .catch(() => refused('credits.status failed'))
+              .then(answer => {
+                updateProvider(provider, {
+                  statuses: creditStatusesFrom(answer),
+                })
+              })
+          }
+        }
+      }
     } catch (cause) {
       if (!mountedRef.current) return
       setError(cause instanceof Error ? cause.message : String(cause))
@@ -349,7 +381,10 @@ export function ChannelPoolSection({ t }: { readonly t?: Translate | undefined }
     await load()
     if (!mountedRef.current) return
     if (entriesRef.current.length > 0) return
-    if (attempt >= LOAD_RETRIES) return
+    if (attempt >= LOAD_RETRIES) {
+      setSettled(true)
+      return
+    }
     window.setTimeout(() => { if (mountedRef.current) void loadWithRetry(attempt + 1) }, RETRY_INTERVAL_MS)
   }
 
@@ -608,7 +643,21 @@ export function ChannelPoolSection({ t }: { readonly t?: Translate | undefined }
   // "add an account on the login page" only repeats the nav row the reader
   // just clicked. Render nothing rather than a placeholder that reads like a
   // failure. A load ERROR still speaks, because that one is a real problem.
-  if (entries.length === 0 && error === undefined) return <></>
+  //
+  // The one thing an empty page must not do is keep claiming to load after the
+  // retries are spent: that is what turned a slow first paint into "the page is
+  // permanently stuck", and it is indistinguishable from a hung mount.
+  if (entries.length === 0 && error === undefined) {
+    return (
+      <section className="dsm-xdpool-cpool" aria-label={t?.('channelpool.title') ?? 'Channels'}>
+        <p className="dsm-xdpool-note">
+          {settled
+            ? (t?.('channelpool.empty') ?? 'No channel accounts yet — add one on the scan-login page and the channel shows up here.')
+            : (t?.('chan.pending') ?? '扫码渠道加载中…')}
+        </p>
+      </section>
+    )
+  }
   return (
     <section className="dsm-xdpool-cpool" aria-label={t?.('channelpool.title') ?? 'Channels'}>
       {error === undefined ? null

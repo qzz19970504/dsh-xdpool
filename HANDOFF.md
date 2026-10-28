@@ -1,15 +1,17 @@
 # HANDOFF — XD Pool 账号池「扫码渠道卡片」不显示
 
-> 最后更新：2026-10-28 19:10（Asia/Shanghai）
-> 接手者请先读「1. 一句话现状」和「6. 下一步」，再看其余细节。
+> 最后更新：2026-10-28 21:40（Asia/Shanghai）
+> 接手者请先读「1. 一句话现状」；**问题已在 2026-10-28 定位并修复**，§6 的「下一步」已作废，保留仅作诊断方法参考。
 
 ---
 
 ## 1. 一句话现状
 
-**问题未解决。** 账号池第一页的 WorkBuddy 国内版/国际版两张卡正常，但下方「其他厂商（扫码渠道）」区块**永久停在**「扫码登录通道正在加载…」，既不出现卡片，也不报错。
+**已修复（待目视复验）。** 真因是首屏 `Promise.all` 里混进了每个渠道的 `model.list`：cline 的 `model.list` 会拉远端模型目录（models.dev + 厂商端点，各 20s 超时），实测 24s 时仍在飞、整页 >60s 才出卡片。用户看到的「扫码登录通道正在加载…」不是死锁，而是**被一个慢渠道扣住的首屏**。
 
-已有若干修复已合并、已构建、已部署到本地运行环境，但**没有解决这个症状**。因此下一步**不要再盲改逻辑**，先用第 6 节的诊断把「到底卡在哪一步」变成可观测事实。
+修复：`load()` 的 Phase 1 只 `await account.list`（本地内存 + `credentials.describe`），卡片先落地；`model.list` → 排序写入 → 拉宿主模型事实改到 Phase 2 按渠道独立执行。另加「重试耗尽后显示『还没有渠道账号』而不是永远『加载中』」。
+
+**三条候选假设实测全部排除**（诊断值见 §5.1）：H1 信封解析（`statuses=11 withAccounts=10`）、H2 RPC 桥（`resolved/rpc/3ms`）、H3 StrictMode（`setups=1 cleanups=0`，且 app.asar 内是 react.production.min.js）。
 
 ---
 
@@ -21,9 +23,10 @@
 | 运行位置 | `C:\Users\44575\.dsh\profiles\desktop\node_modules\dsh-xdpool`（**不是 Git 仓库**，靠手工覆盖产物更新） |
 | 工作仓库 | `projects/dsh-xdpool/`（Git，`origin`=`qzz19970504/dsh-xdpool`，`upstream`=`XDTrees/dsh-xdpool`） |
 | 分支 | `fix/channel-pool-and-provider-registration` |
-| HEAD | `c8df444 perf(client): cache channel entries across unmounts and add server-side fact caching` |
-| 历史提交 | `d688b90`（撤销别名） → `5190b96`（初版修复） → 基于 `6e4854f`（上游 2.4.6） |
-| 安装包一致性 | `lib/client.js` 在仓库与安装目录 **sha256 完全相同**（`f32f2dc1…`）；`lib/index.js` 同样相同（`155babd9…`） |
+| HEAD（修复前） | `8bbb2c0 docs: add handoff for the unresolved channel-card loading issue` |
+| 历史提交 | `8bbb2c0`（handoff） → `c8df444`（跨卸载缓存） → `d688b90`（撤销别名） → `5190b96`（初版修复） → 基于 `6e4854f`（上游 2.4.6） |
+| 安装包一致性 | 修复前 `lib/client.js` = `f32f2dc1…`；修复后 = `78f9081e…`（仓库构建产物与安装目录相同）；`lib/index.js` 未变 `155babd9…` |
+| 构建 | `pnpm run build` 在 `verify-deps-before-run` 阶段会先跑 `pnpm install` 并因 `@deepseek-ai/dsh-attachment` 镜像缺版而**直接失败（tsdown 根本没跑）**；用 `node_modules/.bin/tsdown` 直接构建 |
 | 最近启动 | `2026-10-28T08:45:11Z` 健康：`providers registered … directory=mounted`，**无** `REJECTED` |
 
 > ⚠️ **不要**在插件市场点更新、也不要跑 `pnpm install`，那会用 npm 官方版覆盖本地产物（源码 commit 不受影响，但运行环境会退回原版）。
@@ -38,7 +41,9 @@
 
 ### 3.2 首屏被公网查询阻塞（已修，`src/client/ChannelPoolSection.tsx`）
 `load()` 原本在 `setEntries` 之前 `await` 全部厂商的 `credits.balances` / `credits.status`。
-**已改**：两阶段——Phase 1 只 `await` `account.list` + `model.list`（pack 内为内存读）后立即 `setEntries`；Phase 2 逐 provider 后台补余额/签到/模型事实。
+**已改**：两阶段——Phase 1 `await` `account.list` + `model.list` 后立即 `setEntries`；Phase 2 逐 provider 后台补余额/签到/模型事实。
+
+> ⚠️ **2026-10-28 修正**：这里的「`model.list` 在 pack 内是内存读」是**错的**。`model.list` 会走 `catalogFactsFor → adapter.resolveModel → ensureRemoteModels()`，cline 的实现拉 `models.dev` + 厂商端点（各 20s 超时），实测 24s 时仍在飞。把它留在首屏 → 整页 >60s 才出卡片，表现为「永久加载中」。现已移出 Phase 1，见 §3.8。
 
 ### 3.3 服务端模型事实无缓存（已修，`src/index.ts` `channelModels`）
 原每次对上百个模型重新 `ctx.llm.resolveModelInfo`，实测单次 **25.8 秒**。
@@ -110,59 +115,56 @@ useEffect(() => () => { mountedRef.current = false }, [])   // ← 只在卸载�
 
 > 附注：`loadGenerationRef`（防止旧加载覆盖新加载）和 `settled`/`diagnostic`（空态诊断）在本分支的最近一次重写中**已被丢掉**，当前源码中 `grep loadGenerationRef` 与 `grep diagnostic` 均为 0 命中。早期独立补丁版（`projects/xdpool-patch/`）里曾有这两项并通过过对应测试，可作为参考实现。
 
+### 5.1 实测结论（2026-10-28，决定性证据）
+
+第 0 步加的临时诊断（`stage` / `withAccounts` / `inflight` / 每渠道 5s 限时探测）在运行中的插件上截到：
+
+```
+stage=phase1:9/10:minimax  age=24s  channels=11  ok=true  statuses=11  withAccounts=10
+answer={ok,value} value={statuses}   rpc=resolved/rpc/3ms/{ok,value} value={statuses}
+mount=true  setups=1  cleanups=0  entries=0
+inflight=model.list/cline@24s
+recent=model.list/raccoon:140ms, /loomy:252ms, /codearts:263ms, /minimax:342ms
+probe=… cline:a=ok,m=T …       ← 10 家里只有 cline 的 model.list 超过 5s
+```
+
+- **H1 排除**：信封 `{ok,value} value={statuses}` 正是解析器要的形状，11 家全部解析出来、10 家有账号。
+- **H2 排除（整体挂住）**：`provider.status` 3ms 返回；桥是 `resolved/rpc` 路径，不是裸 fetch。
+- **H3 排除**：`setups=1 cleanups=0`；另从 `app.asar` 抽出真正在跑的 web bundle 确认是 `react.production.min.js` + react-dom 18.3.1，生产版不做 StrictMode 双调用。
+- **真因**：`stage` 停在 Phase 1 的 `Promise.all` 上，唯一在飞的调用是 `model.list/cline`；用户实测等 60–90s 后卡片才出现 → 不是死锁，是**首屏被一个慢渠道的远端模型目录拉取扣住**。
+
+### 5.2 `model.list` 不是内存读（推翻 §3.2 的前提）
+`vendor/channel-pack/pack.js` 的 `model.list` 会 `catalogFactsFor() → adapter.resolveModel() → ensureRemoteModels()`。cline 的 `fetchRemoteModels` = `models.dev/api.json` + 厂商端点，各 `AbortSignal.timeout(20_000)`，失败后还有 30s 冷却与重试。所以「所有渠道的 model.list 都秒回」这个前提本身不成立。
+
 ---
 
-## 6. 下一步（按顺序执行，不要跳步）
+## 6. 本次修复（2026-10-28，已完成）
 
-### 第 0 步（必做，约 5 分钟）：把静默 pending 变成一行可读诊断
+> 下面 §6.1 保留「怎么把静默 pending 变成可读事实」的方法论，诊断代码本身已删除（不再留 `TEMPORARY` 痕迹）。
 
-改 `src/client/ChannelPoolSection.tsx`：
+### 6.1 做法：把静默 pending 变成一行可读诊断
+1. `diagnostic`：在 `providerStatusesFrom()` 之后立刻记录 `channels / ok / statuses / withAccounts`，**写在 `mountedRef` 提前返回之前**；
+2. `stage`：`channels → provider.status → phase1:done/total:provider → rendered:n → done:n`，挂住时能指出卡在哪一步；
+3. `inflight=` / `recent=`：每个 `callPack` 记录开始/结束时间，秒级刷新，能看出「哪个调用、等了多久」；
+4. 每渠道 5s 限时复刻探测（`probe=provider:a=ok|err|T,m=…`），不再让「慢」与「死」混为一谈；
+5. 空态区分「还在加载」与「加载完了确实没有账号」。
 
-1. 增加 `const [diagnostic, setDiagnostic] = useState<string | undefined>(undefined)`；
-2. 在 `load()` 里 `providerStatusesFrom(statusAnswer)` 之后立刻记录：
-   ```tsx
-   setDiagnostic(
-     `channels=${channels.length} ok=${String(statusAnswer.ok)} ` +
-     `statuses=${statuses.size} withAccounts=${scanProviders.length}` +
-     (statusAnswer.ok ? '' : ` err=${statusAnswer.error?.message ?? '?'}`)
-   )
-   ```
-3. 空态渲染改成显示 `已加载 / 加载中` + diagnostic：
-   ```tsx
-   <p className="dsm-xdpool-note">
-     {settled ? `无渠道账号 ${diagnostic ?? ''}` : `扫码渠道加载中… ${diagnostic ?? ''}`}
-   </p>
-   ```
-   （`settled` 可在 `loadWithRetry` 达到 `LOAD_RETRIES` 或 `entriesRef.current.length > 0` 时置 `true`）
-4. 顺手修 H3：把 effect 改成
-   ```tsx
-   useEffect(() => {
-     mountedRef.current = true
-     return () => { mountedRef.current = false }
-   }, [])
-   ```
+### 6.2 修法（最终提交内容）
+- `ChannelPoolSection.tsx` `load()`：**Phase 1 只 `await account.list`**，卡片立即落地（`models: []`）；`model.list` → `sortChannelModels` → `fetchChannelModels`（宿主模型事实）整体移到 Phase 2，按渠道并发、互不阻塞。
+- `model.list` 被拒时仍写 `modelError` 并在卡片上如实显示，不会被折叠成「没有发布模型」。
+- `mountedRef`：effect setup 里置 `true`（cleanup 仍置 `false`）。
+- 重试耗尽后空态改为 `channelpool.empty` 文案，不再永远「加载中」。
+- 回归测试：`tests/channel-pool-mount.test.ts`（6 例）——先红后绿：
+  - `mountedRef` setup 重新置 true / cleanup 置 false；
+  - `load()` 中 `account.list` 在 `setEntries(next)` 之前，**任何** `model.list` 都在其后；
+  - Phase 1 返回体带 `models: []`；
+  - 空态文案区分「加载中」与「已加载且为空」。
 
-构建 + 覆盖部署（见第 7 节），刷新界面后**截一张图**。
-
-### 第 1 步：按诊断结果分流
-
-| 诊断输出 | 结论 | 动作 |
-|---|---|---|
-| `ok=true statuses=0 withAccounts=0` | H1：信封/解析不匹配 | 在 `callPack` 里把 `result` 原样 `console.debug` 一次，确认真实形状；相应修正 `providerStatusesFrom` 的取值路径（`value.statuses` / `result.statuses` / 双层 `value.value.statuses`） |
-| `ok=false err=…` | 桥仍未通 | 看 err 文案；确认 `installPackRpc(ctx)` 拿到的 `ctx.connection.rpc.call` 是否可用；必要时改走 `connection.fetch`（pack 自己用 `connection.fetch.register` 注册了 `/api/channel-pack`） |
-| `channels=13 statuses=13 withAccounts=0` | pack 内存池确实为空 | 对比 `GET /plugins/dsh-xdpool/channels` 与 `~/.dsh/channel-pack/state.json`；怀疑不同 pack 实例/存储后端 |
-| `channels=0` | `fetchChannels()` 返回空 | 检查 `/plugins/dsh-xdpool/channels` 的 `channels` 字段 |
-| **完全没有诊断文字** | `load()` 从未进入/永远 await | H2：给 `callPack` 加超时日志，确认是否挂住 |
-
-### 第 2 步：修好后补回归测试
-
-现有测试都在 `tests/`（vitest）。可参考 `projects/xdpool-patch/tests/client-patch.test.cjs`（用 `vm` 从真实 bundle 抽函数）来写：
-- 「连接晚到后 `callPack` 仍能解析桥」；
-- 「余额慢不影响卡片先落地」；
-- 「StrictMode setup-cleanup-setup 后 `mountedRef` 恢复为 true」；
-- 「同名不同 id 的账号都保留」。
-
-必须**先看测试失败**再改实现。
+### 6.3 验证
+- 全量 `vitest run`：`1032 passed / 1 failed`（唯一失败是 §9 记录的 `billion-page` 环境断言）;
+- `tsc -p tsconfig.client.json` 对改动文件无错误；`tsdown` 构建成功；
+- 部署后安装目录 `lib/client.js` sha256 = `78f9081e…` = 仓库构建产物；`node --check` 通过；bundle 内已无临时诊断字符串；
+- 用户实测：刷新后 11 张渠道卡片 1–2 秒内出现（修复前 60–90s）。
 
 ---
 
@@ -170,8 +172,8 @@ useEffect(() => () => { mountedRef.current = false }, [])   // ← 只在卸载�
 
 ```bash
 cd projects/dsh-xdpool
-node_modules/.bin/vitest run                                  # 当前基线：78 文件 / 1027 例通过
-pnpm run build                                                # tsdown 产出 lib/
+node_modules/.bin/vitest run                                  # 当前基线：80 文件 / 1033 例，1032 通过 + 1 例 §9 环境断言
+node_modules/.bin/tsdown                                      # 产出 lib/（不要用 pnpm run build，理由见下）
 # 覆盖到运行环境（三个文件缺一不可）：
 cp lib/client.js lib/index.js ~/.dsh/profiles/desktop/node_modules/dsh-xdpool/lib/
 cp vendor/channel-pack/pack.js ~/.dsh/profiles/desktop/node_modules/dsh-xdpool/vendor/channel-pack/
@@ -182,7 +184,8 @@ node --check ~/.dsh/profiles/desktop/node_modules/dsh-xdpool/lib/client.js
 - `~/.xdpool/startup.log` 末尾应为 `providers registered … directory=mounted`，**不得**出现 `adapters REJECTED`；
 - 账号池页应出现各厂商卡片。
 
-> 构建时会打印 `ERR_PNPM_NO_MATCHING_VERSION`（`@deepseek-ai/dsh-*` 的 peer 在镜像源缺失），**可以忽略**，tsdown 仍会正常完成。
+> ⚠️ **`pnpm run build` 实际不可用**（2026-10-28 实测）：pnpm 的 `verify-deps-before-run` 会先自动执行 `pnpm install`，因 `@deepseek-ai/dsh-attachment` 在 npmmirror 上无匹配版本而**直接失败退出，tsdown 根本没跑**，`lib/` 保持旧产物。用 `node_modules/.bin/tsdown` 直接构建。
+> 另：`lib/` 是**被 Git 跟踪的构建产物**，但仓库检出为 CRLF 而 tsdown 输出为 LF，`git status` 会一直显示 `lib/bin.js` / `lib/index.d.ts` 已修改（`git diff --stat` 为空）——用 `git add` 过滤后不会产生噪声 diff。
 
 ---
 
