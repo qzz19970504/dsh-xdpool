@@ -22,9 +22,9 @@ import type { WorkBuddyCatalog, WorkBuddyModelInfo } from './catalog.ts'
 import { isAggregateCatalog, type AggregateCatalog, type AggregateModelRow } from './aggregate.ts'
 import type { ComboModelRow } from './combos.ts'
 import type { WorkBuddyShim } from './shim.ts'
-import type { FreeModelRow } from './free-catalog.ts'
+/** No per-token pricing is knowable for a subscription quota; report zero. */
+const NO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } as const
 /** Provider route this bundle owns. */
-/** Provider route this bundle owns for the domestic (CN) gateway. */
 export const XDPOOL_PROVIDER = 'xdpool'
 /** Provider route this bundle owns for the international gateway. */
 export const XDPOOL_GLOBAL_PROVIDER = 'xdpool-global'
@@ -39,27 +39,6 @@ export const XDPOOL_GLOBAL_PROVIDER = 'xdpool-global'
  * panel, both of which the user reads as WorkBuddy traffic.
  */
 export const XDPOOL_AGGREGATE_PROVIDER = 'xdpool-aggregate'
-/**
- * Provider route for the免密 free lane.
- *
- * A distinct id for the same reason as the aggregate lane: this lane draws on a
- * POOLED gateway credential with its own per-session quota, so folding its rows
- * into a pool lane would put a shared-quota 429 into the pool's cooldown table
- * and its tokens into the pool's usage panel — both of which the user reads as
- * their own WorkBuddy traffic.
- */
-export const XDPOOL_FREE_PROVIDER = 'xdpool-free'
-/**
- * Display name the free lane registers under, so the picker can group it.
- *
- * It is the only extra lane: the co-paid (EAC) lane that used to sit beside it
- * was removed on the user's instruction, because its whole reason for existing
- * was a sealed shared-signing entry only the original build's host could open,
- * and a lane that answers 503 for everyone else is worse than no lane at all.
- */
-export const EXTRA_LANE_NAMES = {
-  free: 'XD Pool · 免费模型',
-} as const
 /** The provider id each region registers as. */
 export const POOL_PROVIDER_BY_REGION = {
   cn: XDPOOL_PROVIDER,
@@ -68,17 +47,22 @@ export const POOL_PROVIDER_BY_REGION = {
 /**
  * Display name each region registers under, so the picker can group them.
  *
- * "XD Pool" rather than the old "WorkBuddy XD Pool": the picker row is the only
- * place this string surfaces, and the brand the user asked for is XD Pool. The
- * REGION suffix stays because both lanes register real providers under different
- * ids — dropping it would leave two identically-named groups in the dropdown.
+ * "WorkBuddy" rather than "XD Pool": the picker row names the vendor the models
+ * actually come from, and the user's own tooling (a screenshot of their picker)
+ * already shows "XD Pool（国内版）" beside a confusingly similar "WorkBuddy
+ * (国内版)" group from the vendored channel pack. Removing the pack's duplicate
+ * registration (its buddy / workbuddy adapters are no longer registered) leaves
+ * ONE group per region, and naming it after the real provider removes the last
+ * of the ambiguity. The REGION suffix stays because both lanes register real
+ * providers under different ids — dropping it would leave two identically-named
+ * groups in the dropdown.
  *
  * Display name only. The provider ids above are what the host matches on when it
  * persists a selection, so renaming a group must never touch them.
  */
 export const POOL_NAME_BY_REGION = {
-  cn: 'XD Pool（国内版）',
-  global: 'XD Pool（国际版）',
+  cn: 'WorkBuddy（国内版）',
+  global: 'WorkBuddy（国际版）',
 } as const
 /** Provider idle ceiling while one stream read is outstanding. */
 export const WORKBUDDY_STREAM_IDLE_TIMEOUT_MS = 300_000
@@ -107,8 +91,6 @@ const INERT_AUTH: { credentials: CredentialStore; authContext: AuthContext } = {
     async fileExists() { return false },
   },
 }
-/** No per-token pricing is knowable for a subscription quota; report zero. */
-const NO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } as const
 export interface WorkBuddyAdapterOptions {
   shim: WorkBuddyShim
   catalog: WorkBuddyCatalog | AggregateCatalog
@@ -116,16 +98,6 @@ export interface WorkBuddyAdapterOptions {
   ctx: Context
   providerId?: string
   displayName?: string
-  /**
-   * The rows this provider serves, when it is a LATER lane rather than a pool.
-   *
-   * A fourth route registers its own provider id, so it owns its whole roster
-   * and `catalog` is never consulted for it — passing a pool catalog there is not
-   * a silent default, it is ignored on purpose. The roster is read per call,
-   * exactly like the pool's, so a refresh that lands after startup is visible
-   * without a restart.
-   */
-  extraRows?: (() => readonly FreeModelRow[]) | undefined
 }
 /** What {@link createWorkBuddyAdapter} hands back. */
 export interface WorkBuddyAdapter {
@@ -296,40 +268,6 @@ function toComboModel(row: ComboModelRow, baseUrl: string, providerId: string): 
   } as unknown as Model<Api>
 }
 /**
- * Build one pi-ai model descriptor for a free lane row.
- *
- * The thinking control IS offered here, unlike the aggregate lane: this lane
- * publishes a measured `efforts` menu, so "unknown" would withhold a control the
- * user demonstrably has. The ceiling comes from the lane's own capability table
- * rather than a model card, because the table is what the lane was probed
- * against.
- */
-function toExtraLaneModel(row: FreeModelRow, baseUrl: string, providerId: string): Model<Api> {
-  const efforts = 'efforts' in row && Array.isArray(row.efforts) && row.efforts.length > 0 ? row.efforts : undefined
-  const map = efforts === undefined ? undefined : thinkingLevelMap({
-    id: row.id,
-    name: row.name,
-    contextWindow: row.contextWindow,
-    maxOutputTokens: row.maxOutput,
-    supportsImages: row.vision,
-    supportedEfforts: efforts,
-  })
-  return {
-    id: row.modelId,
-    name: row.name,
-    api: 'openai-completions',
-    provider: providerId,
-    baseUrl,
-    input: row.vision ? ['text', 'image'] : ['text'],
-    cost: NO_COST,
-    contextWindow: row.contextWindow,
-    maxTokens: row.maxOutput,
-    reasoning: row.reasoning,
-    ...map === undefined ? {} : { thinkingLevelMap: map },
-    compat: { supportsReasoningEffort: map !== undefined },
-  } as unknown as Model<Api>
-}
-/**
  * Assemble the adapter. `getModels` re-reads the live catalog, and every
  * model's `baseUrl` is re-resolved per read so the shim's ephemeral port
  * applies from the first snapshot after startup. Call only after `shim.ready`.
@@ -343,12 +281,8 @@ export function createWorkBuddyAdapter(options: WorkBuddyAdapterOptions): WorkBu
   const providerId = options.providerId ?? XDPOOL_PROVIDER
   const displayName = options.displayName ?? 'XD Pool'
   const aggregateCatalog = isAggregateCatalog(catalog)
-  const extraRows = options.extraRows
   const buildModels = (): Model<Api>[] => {
     const baseUrl = `${shim.baseUrl()}/v1`
-    if (extraRows !== undefined) {
-      return (extraRows() ?? []).map(row => toExtraLaneModel(row, baseUrl, providerId))
-    }
     if (aggregateCatalog) {
       // Narrowed per set on purpose: a third-party row and a chain row are
       // different records with different fields, and pushing both through one

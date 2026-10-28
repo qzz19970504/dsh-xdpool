@@ -53,6 +53,9 @@ export const PROVIDER_ID_RENAMES: Readonly<Record<string, string>> = Object.free
   'workbuddy-xdpool': 'xdpool',
   'workbuddy-xdpool-global': 'xdpool-global',
   'workbuddy-xdpool-aggregate': 'xdpool-aggregate',
+  // The免密 lane was removed (2026-10-29): its old id still maps so a pinned
+  // default-model row names its own absence rather than looking like a typo.
+  // Nothing re-answers under it — that is the point of removing the lane.
   'workbuddy-xdpool-free': 'xdpool-free',
 })
 /** Result of an adoption attempt, for the caller to log. */

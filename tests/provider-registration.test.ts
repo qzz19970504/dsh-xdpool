@@ -50,16 +50,23 @@ describe('a rejected directory entry cannot take the adapters down with it', () 
     const block = registrationBlock()
     const adapterCalls = block.match(/ctx\.llm\.registerAdapter\(/g) ?? []
     const directoryCall = block.match(/ctx\.llm\.registerConfigurableProviders\(/g) ?? []
-    // Four providers now: the two pool lanes, the aggregate lane and the
-    // credential-free lane. All four in the adapters try, the directory after.
-    expect(adapterCalls).toHaveLength(4)
+    // Three providers now: the two pool lanes and the aggregate lane. The
+    // credential-free lane (`xdpool-free`) was removed on the user's
+    // instruction — its rows duplicated what the scan-login pages already
+    // served better, and a pooled quota lane read as the pool's own spend.
+    // All three in the adapters try, the directory after.
+    expect(adapterCalls).toHaveLength(3)
     expect(directoryCall).toHaveLength(1)
-    // The four adapter calls must all precede the directory call: the adapters
+    // The three adapter calls must all precede the directory call: the adapters
     // have to be LIVE before the directory is offered, so a directory rejection
     // finds something already installed to keep.
     const lastAdapter = block.lastIndexOf('ctx.llm.registerAdapter(')
     const directoryAt = block.indexOf('ctx.llm.registerConfigurableProviders(')
     expect(lastAdapter).toBeLessThan(directoryAt)
+    // The removed lane must stay removed: no adapter, no directory entry and no
+    // discovery branch may name it again.
+    expect(block).not.toContain('XDPOOL_FREE_PROVIDER')
+    expect(block).not.toContain('xdpool-free')
   })
   it('has no all-or-nothing finally that releases adapters on a directory failure', () => {
     const block = registrationBlock()
@@ -75,7 +82,6 @@ describe('a rejected directory entry cannot take the adapters down with it', () 
       'releaseAdapterCn',
       'releaseAdapterGlobal',
       'releaseAdapterAggregate',
-      'releaseAdapterFree',
       'releaseDirectory',
     ]) {
       const declarations = block.match(new RegExp(`let ${name}\\b`, 'g')) ?? []

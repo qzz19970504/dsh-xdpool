@@ -137,39 +137,6 @@ export interface AggregateLaneOptions {
   /** Where the stored settings come from, re-read per request. */
   readStore: () => AggregateStore
 }
-export interface ExtraLaneOptions {
-  /**
-   * The免密 free lane: which rows exist right now, and where to send a turn.
-   *
-   * The row reader is consulted per request, exactly like the pool's catalog —
-   * a roster that refreshed after startup must be servable without a restart.
-   */
-  free: ExtraLaneSource
-}
-export interface ExtraLaneSource {
-  /**
-   * The rows this lane offers.
-   *
-   * `name` is the human-facing display name the free catalog already keeps (a
-   * raw upstream id is deliberately never shown to a picker); it is optional
-   * here because the lane's own contract only ever needed the ids, and the
-   * gateway's model picker is the first consumer that wants the label too.
-   */
-  current: () => readonly { modelId: string; id: string; name?: string }[]
-  /**
-   * Run one turn, handing back the frames to write.
-   *
-   * The source owns the whole upstream conversation — the session identity, the
-   * wire conversion, the tool bookkeeping — and returns chat-wire SSE payloads,
-   * because that is the only wire this shim's caller speaks.
-   */
-  run: (options: {
-    modelId: string
-    body: string
-    signal: AbortSignal
-    onFrame: (payload: string) => void
-  }) => Promise<unknown>
-}
 export interface WorkBuddyShimOptions {
   pool: WorkBuddyAccountPool
   client: WorkBuddyUpstreamClient
@@ -201,16 +168,7 @@ export interface WorkBuddyShimOptions {
    */
   aggregate?: AggregateLaneOptions
   /**
-   * The third and fourth lanes: the pooled免密 gateway and the sealed co-paid
-   * relay.
-   *
-   * Also CN-shim-only, for the aggregate lane's reason plus one of their own: a
-   * second copy under the global provider id would list every model twice and
-   * give the user two names for one lane.
-   */
-  extra?: ExtraLaneOptions
-  /**
-   * The fifth lane: the 扫码登录 channels, reached through the host's own LLM
+   * The fourth lane: the 扫码登录 channels, reached through the host's own LLM
    * seam rather than a socket this plugin owns.
    *
    * CN-shim-only for the aggregate lane's reason — a second copy under the
@@ -395,7 +353,6 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
   const region = options.region
   const logger = options.logger
   const aggregate = options.aggregate
-  const extra = options.extra
   const channels = options.channels
   const lanModels = options.lanModels
   const maxAttempts = options.maxAttempts ?? 8
@@ -469,83 +426,6 @@ function withBareModelId(raw: string, modelId: string): string {
     const row = aggregate.catalog.find(modelId)
     if (row === undefined || row.providerId !== parsed.providerId || row.modelId !== parsed.modelId) return undefined
     return parsed
-  }
-  /**
-   * The extra lane a prefixed model id names, or undefined.
-   *
-   * A prefixed id cannot collide with anything else: `free:` is the plugin's own
-   * convention and no gateway publishes a model whose id begins with it. That is
-   * why this lane can be routed on the id's PREFIX while the aggregate lane is
-   * routed on a slash — no header, no extra field, and no chance of a caller
-   * spoofing its way into a lane by guessing.
-   *
-   * A prefixed id the lane does not currently offer is reported as
-   * unavailable, never routed to the pool: the pool would answer "sign in to
-   * WorkBuddy" for a model it has never heard of, and the user would go looking
-   * for a login that is not the problem.
-   */
-  function extraLaneFor(modelId: string | undefined): { source: ExtraLaneSource; modelId: string; lane: string } | undefined {
-    if (modelId === undefined || extra === undefined) return undefined
-    if (!modelId.startsWith(FREE_MODEL_PREFIX)) return undefined
-    const source = extra.free
-    if (source === undefined) return undefined
-    const bare = modelId.slice(FREE_MODEL_PREFIX.length)
-    // Only a row the roster currently holds is served, so a stale picker entry
-    // cannot reach an upstream this shim no longer has a route for.
-    if (!source.current().some(row => row.modelId === modelId || row.id === bare)) return undefined
-    return { source, modelId: bare, lane: 'free' }
-  }
-  /** The lane that a prefixed id names even when its roster is empty. */
-  function extraLaneNamed(modelId: string | undefined): string | undefined {
-    if (modelId === undefined || extra === undefined) return undefined
-    return modelId.startsWith(FREE_MODEL_PREFIX) ? 'free' : undefined
-  }
-  /**
-   * Serve one extra-lane turn.
-   *
-   * The lane arrives here as chat completions, which is the point of the
-   * translation layer: the caller never learns which of the three upstream wires
-   * the row actually speaks. The source owns the whole turn — session identity,
-   * body re-spelling, tool-name restoration, event folding — and hands back chat
-   * payloads, so this function only frames them.
-   */
-  async function serveExtraCompletion(
-    res: ServerResponse,
-    raw: string,
-    modelId: string,
-    target: { source: ExtraLaneSource; modelId: string; lane: string },
-    signal: AbortSignal,
-  ): Promise<void> {
-    const frames: string[] = []
-    try {
-      await target.source.run({
-        modelId: target.modelId,
-        body: raw,
-        signal,
-        onFrame: payload => frames.push(payload),
-      })
-    } catch (error: unknown) {
-      if (res.headersSent) {
-        res.end()
-        return
-      }
-      const kind = error instanceof AggregateError ? error.kind : 'server'
-      const message = error instanceof AggregateError ? error.message : error instanceof Error ? error.message : String(error)
-      writeOpenAIError(res, KIND_STATUS[kind], `${target.lane}_${kind}`, message)
-      return
-    }
-    res.writeHead(200, {
-      'Content-Type': 'text/event-stream',
-      'Cache-Control': 'no-cache',
-      'Connection': 'keep-alive',
-      'X-Accel-Buffering': 'no',
-    })
-    // Always one terminating frame, even when the upstream sent nothing: a
-    // decoder that sees no `[DONE]` reads a finished turn as a stream the
-    // gateway cut, which the host answers with a retry.
-    for (const payload of frames) res.write(`data: ${payload}\n\n`)
-    res.write('data: [DONE]\n\n')
-    res.end()
   }
   /**
    * Serve one login-channel turn.
@@ -881,18 +761,6 @@ function withBareModelId(raw: string, modelId: string): string {
         })
       }
     }
-    // The extra lanes list under their OWN channel tag, never under the shim's
-    // owner: a `free:` row served here is not WorkBuddy traffic, and `owned_by`
-    // is what a client reads to tell them apart.
-    if (extra !== undefined) {
-      for (const row of extra.free.current()) {
-        entries.push({
-          id: row.modelId,
-          name: row.name ?? row.modelId,
-          source: FREE_CHANNEL,
-        })
-      }
-    }
     if (channels !== undefined) {
       // `listModels` is a round trip per channel, and each one already swallows
       // its own failure inside the lane. Wrapped again so a lane that throws
@@ -1185,30 +1053,18 @@ function withBareModelId(raw: string, modelId: string): string {
       await serveAggregateCompletion(res, raw, modelId as string, aggregateRow, controller.signal)
       return
     }
-    // The pooled免密 and sealed co-paid lanes are decided by the id PREFIX. They
-    // are checked after the aggregate lane on purpose: neither id shape contains
-    // a slash the composite parse would accept, so the order is a readability
-    // choice, not a correctness one — but a prefix check placed first would have
-    // to run on every pool request.
-    const extraTarget = extraLaneFor(modelId)
-    if (extraTarget !== undefined) {
-      await serveExtraCompletion(res, raw, modelId as string, extraTarget, controller.signal)
-      return
-    }
-    const lane = extraLaneNamed(modelId)
-    if (lane !== undefined) {
-      // A prefixed id whose roster is empty — the listing failed, the model was
-      // withdrawn, or the co-paid lane has no sealed credential on this build —
-      // must NOT fall through to the pool. The pool would report "not signed in"
-      // for a lane that never had a WorkBuddy problem, and the user would go
-      // looking for a login that is not the reason.
+    // A `free:`-prefixed id names a lane this build no longer serves. The
+    // 免密 lane was removed (its rows duplicated what the scan-login channels
+    // already serve), and a stale picker entry or a cached gateway client must
+    // be told the lane is GONE — not "not signed in", which is what the pool
+    // fallback below would answer and is the one message that sends a user
+    // looking for a login that is not the problem.
+    if (modelId !== undefined && modelId.startsWith(FREE_MODEL_PREFIX)) {
       writeOpenAIError(
         res,
         503,
-        `${lane}_unavailable`,
-        lane === 'free'
-          ? `${modelId as string} is not available right now; the free lane's model listing is refreshed on the XD Pool card`
-          : `${modelId as string} is not available right now; sign in to the co-paid lane on the XD Pool card`,
+        'free_lane_removed',
+        `${modelId} belongs to the removed free lane; pick the model from its own provider group instead`,
       )
       return
     }
@@ -1230,7 +1086,7 @@ function withBareModelId(raw: string, modelId: string): string {
     // Doing only the latter would route correctly and then send an upstream a
     // model it has never heard of.
     //
-    // Stripped here — after the chain, aggregate and extra lanes have each had
+    // Stripped here — after the chain, aggregate and free lanes have each had
     // their chance — so the prefix cannot be used to reach a lane the caller
     // would not otherwise have named. A remainder that itself spells another lane
     // is refused rather than silently re-routed.

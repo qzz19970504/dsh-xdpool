@@ -68329,8 +68329,25 @@ function apply(ctx, config = {}) {
       "QUOTA_EXCEEDED"
     );
   };
+  // dsh-xdpool 本地适配（2026-10-29）：不再注册 buddy / workbuddy 两个 LLM
+  // 适配器。这两个 provider 与本插件自己的账号池 provider（xdpool /
+  // xdpool-global）是**同一个厂商的两条平行通道**——各连各的账号库、各出各的
+  // 模型目录，模型选择器里出现两组几乎同名的分组（「XD Pool（国内版）」 vs
+  // 「WorkBuddy (国内版)」），用户无法分辨哪条通到哪个账号。
+  //
+  // 扫码登录页（Channel Pack 自己的页面）完全不受影响：账号管理、积分签到、
+  // `provider.status` 等管理 RPC 都还在；只是这两家不再直接对宿主 LLM 出模型，
+  // 所有 WorkBuddy 流量统一走 xdpool / xdpool-global 的账号池通道。
+  //
+  // 注意 `buddyAdapter` / `workbuddyAdapter` 是闭包自引用（`isFreeModel` 用），
+  // 不能删掉变量本身——用 `null` 占位并让 `isFreeModel` 恒 false（免密判定只
+  // 影响选号门，不注册适配器后不会被调用）。
   const buddy = new BuddyAuth(ctx);
-  const buddyAdapter = registerBuddyLlm(ctx, {
+  const buddyAdapter = null;
+  const buddyAdapterGone = true;
+  void buddyAdapterGone;
+  if (false) {
+  registerBuddyLlm(ctx, {
     credentialRef: credentialRef16(BUDDY_CREDENTIAL_REF),
     resolveCredential: async (modelId) => {
       const picked = await pickBuddyCredential({
@@ -68368,8 +68385,13 @@ function apply(ctx, config = {}) {
     accountPool: pool,
     product: CODEBUDDY
   });
+  }
   const workbuddy = new BuddyAuth(ctx, { product: WORKBUDDY });
-  const workbuddyAdapter = registerBuddyLlm(ctx, {
+  const workbuddyAdapter = null;
+  const workbuddyAdapterGone = true;
+  void workbuddyAdapterGone;
+  if (false) {
+  registerBuddyLlm(ctx, {
     credentialRef: credentialRef16(WORKBUDDY.defaultCredentialRef),
     resolveCredential: async (modelId) => {
       const picked = await pickBuddyCredential({
@@ -68406,6 +68428,7 @@ function apply(ctx, config = {}) {
     accountPool: pool,
     product: WORKBUDDY
   });
+  }
   const lobsterai = new LobsteraiAuth(ctx);
   const lobsteraiAdapter = registerLobsteraiLlm(ctx, {
     credentialRef: credentialRef16(LOBSTERAI.defaultCredentialRef),

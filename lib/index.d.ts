@@ -2897,43 +2897,6 @@ interface AggregateLaneOptions {
   /** Where the stored settings come from, re-read per request. */
   readStore: () => AggregateStore;
 }
-interface ExtraLaneOptions {
-  /**
-   * The免密 free lane: which rows exist right now, and where to send a turn.
-   *
-   * The row reader is consulted per request, exactly like the pool's catalog —
-   * a roster that refreshed after startup must be servable without a restart.
-   */
-  free: ExtraLaneSource;
-}
-interface ExtraLaneSource {
-  /**
-   * The rows this lane offers.
-   *
-   * `name` is the human-facing display name the free catalog already keeps (a
-   * raw upstream id is deliberately never shown to a picker); it is optional
-   * here because the lane's own contract only ever needed the ids, and the
-   * gateway's model picker is the first consumer that wants the label too.
-   */
-  current: () => readonly {
-    modelId: string;
-    id: string;
-    name?: string;
-  }[];
-  /**
-   * Run one turn, handing back the frames to write.
-   *
-   * The source owns the whole upstream conversation — the session identity, the
-   * wire conversion, the tool bookkeeping — and returns chat-wire SSE payloads,
-   * because that is the only wire this shim's caller speaks.
-   */
-  run: (options: {
-    modelId: string;
-    body: string;
-    signal: AbortSignal;
-    onFrame: (payload: string) => void;
-  }) => Promise<unknown>;
-}
 interface WorkBuddyShimOptions {
   pool: WorkBuddyAccountPool;
   client: WorkBuddyUpstreamClient;
@@ -2965,16 +2928,7 @@ interface WorkBuddyShimOptions {
    */
   aggregate?: AggregateLaneOptions;
   /**
-   * The third and fourth lanes: the pooled免密 gateway and the sealed co-paid
-   * relay.
-   *
-   * Also CN-shim-only, for the aggregate lane's reason plus one of their own: a
-   * second copy under the global provider id would list every model twice and
-   * give the user two names for one lane.
-   */
-  extra?: ExtraLaneOptions;
-  /**
-   * The fifth lane: the 扫码登录 channels, reached through the host's own LLM
+   * The fourth lane: the 扫码登录 channels, reached through the host's own LLM
    * seam rather than a socket this plugin owns.
    *
    * CN-shim-only for the aggregate lane's reason — a second copy under the
@@ -2999,61 +2953,8 @@ interface WorkBuddyShimOptions {
 }
 export declare function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShim;
 //#endregion
-//#region src/free-messages.d.ts
-/**
- * Message and frame translation between the OpenAI chat wire the plugin speaks
- * downstream and the three wires the免密 free gateway serves upstream.
- *
- * Downstream there is ONE wire. The pool, the third-party aggregate and the
- * co-paid lane all answer OpenAI chat completions, so the harness adapter is
- * configured once with `openAICompletionsApi()` and this file never has to be
- * reached from there. Upstream there are THREE: `/chat/completions`,
- * `/responses` and `/messages`, chosen per model. Everything about that
- * asymmetry lives here — request bodies go chat to responses/messages, and
- * answers come back responses/messages to chat.
- *
- * WHAT IS NOT IN HERE
- *
- * Images. A harness image arrives as an attachment descriptor, and turning one
- * into bytes the gateway can read is the adapter's job (it owns the attachment
- * plane). When no resolver is supplied an image block is dropped and a warning
- * is recorded, because silently forwarding a placeholder URL would make the
- * model answer about a picture it never saw. Everything else — text, tool
- * calls, tool results, reasoning — round-trips.
- *
- * The tool-call index mapping is the subtle part. Anthropic addresses blocks by
- * position in one flat array and Responses by output item, while OpenAI clients
- * expect a per-request sequential index, and a block may stream its argument
- * fragments BEFORE it names itself. So a block is classified the moment it names
- * itself, its argument fragments are held until then, and a held block whose
- * verdict turns out to be "not executable" is dropped instead of handed to a
- * client that cannot run it.
- *
- * @module src/free-messages
- */
-/** The wire shapes this file translates between. */
-type FreeWire = 'chat' | 'responses' | 'messages';
-//#endregion
-//#region src/free-catalog.d.ts
-/** One free-lane row, as the adapter and the shim both read it. */
-interface FreeModelRow {
-  /** Published id, WITHOUT the `free:` prefix. */
-  id: string;
-  /** The id the picker and the wire both carry. */
-  modelId: string;
-  name: string;
-  wire: FreeWire;
-  vision: boolean;
-  reasoning: boolean;
-  contextWindow: number;
-  maxOutput: number;
-  canDisableThinking: boolean;
-  regionSensitive: boolean;
-}
-//#endregion
 //#region src/adapter.d.ts
 /** Provider route this bundle owns. */
-/** Provider route this bundle owns for the domestic (CN) gateway. */
 export declare const XDPOOL_PROVIDER = "xdpool";
 interface WorkBuddyAdapterOptions {
   shim: WorkBuddyShim;
@@ -3062,16 +2963,6 @@ interface WorkBuddyAdapterOptions {
   ctx: Context$1;
   providerId?: string;
   displayName?: string;
-  /**
-   * The rows this provider serves, when it is a LATER lane rather than a pool.
-   *
-   * A fourth route registers its own provider id, so it owns its whole roster
-   * and `catalog` is never consulted for it — passing a pool catalog there is not
-   * a silent default, it is ignored on purpose. The roster is read per call,
-   * exactly like the pool's, so a refresh that lands after startup is visible
-   * without a restart.
-   */
-  extraRows?: (() => readonly FreeModelRow[]) | undefined;
 }
 /** What {@link createWorkBuddyAdapter} hands back. */
 interface WorkBuddyAdapter {

@@ -21,10 +21,8 @@ import {
   POOL_NAME_BY_REGION,
   POOL_PROVIDER_BY_REGION,
   XDPOOL_AGGREGATE_PROVIDER,
-  XDPOOL_FREE_PROVIDER,
   XDPOOL_GLOBAL_PROVIDER,
   XDPOOL_PROVIDER,
-  EXTRA_LANE_NAMES,
   createWorkBuddyAdapter,
   type AdapterHandle,
   type WorkBuddyAdapter,
@@ -32,8 +30,6 @@ import {
 import { AggregateCatalog, probeAggregateProvider, type AggregateModelRow } from './aggregate.ts'
 import { mountBillionContext, type MountedBillionContext } from './billion-mount.ts'
 import { adoptChannelPackAccounts } from './pack-accounts.ts'
-import { FreeCatalog } from './free-catalog.ts'
-import { createFreeLaneSource } from './free-lane.ts'
 import { getProvider } from './providers.ts'
 import type { WorkBuddyModelInfo } from './catalog.ts'
 import {
@@ -1051,14 +1047,6 @@ function canonicalJson(value: unknown): string {
     () => core.catalogs.cn.current(),
   )
   void aggregateCatalog.refresh()
-  // The免密 free lane. It owns its own roster behind its own provider id, so it
-  // shares neither the pool's cooldown table nor its usage panel.
-  //
-  // Constructed with its static fallback already in place: a lane whose first
-  // listing has not landed must still answer the picker, because an empty group
-  // is the one thing a user reads as "the plugin is broken".
-  const freeCatalog = new FreeCatalog()
-  const freeLane = createFreeLaneSource(freeCatalog, ctx.logger, usageRecorder)
   /**
    * The login channels, for the LAN gateway.
    *
@@ -1108,15 +1096,11 @@ function canonicalJson(value: unknown): string {
       // gateway to be scoped to, so mounting it twice would list the same
       // third-party models under two providers the user cannot tell apart.
       aggregate: { catalog: aggregateCatalog, readStore: () => readAggregateSettingsSync() },
-      // The free lane rides on the CN shim as well: its model ids carry the
-      // lane's own prefix, which is what selects the upstream, so it needs no
-      // gateway of its own and no second loopback listener.
-      extra: { free: freeLane },
-      // The login channels ride on the CN shim too, for the same reason the
-      // aggregate and free lanes do: their ids carry their own channel prefix, so
-      // the shim selects the upstream from the id and needs no listener of its
-      // own. It is also the shim the LAN relay forwards to, which makes this the
-      // one place those models become reachable over OpenAI wire.
+      // The login channels ride on the CN shim too: their ids carry their own
+      // channel prefix, so the shim selects the upstream from the id and needs
+      // no listener of its own. It is also the shim the LAN relay forwards to,
+      // which makes this the one place those models become reachable over
+      // OpenAI wire.
       channels: channelLane,
       // The card's Gateway checkboxes. Enforced only on relay-originated
       // requests, so DSH's own picker is never narrowed by a list meant for
@@ -1703,17 +1687,6 @@ function canonicalJson(value: unknown): string {
             providerId: XDPOOL_AGGREGATE_PROVIDER,
             displayName: '聚合渠道',
           }),
-          // The免密 lane: a pooled gateway credential with a per-session quota.
-          // Its own provider id keeps that shared quota out of the pool's cooldown
-          // table and its tokens out of the pool's usage panel.
-          free: createWorkBuddyAdapter({
-            ctx,
-            shim: shims.cn,
-            catalog: core.catalogs.cn,
-            providerId: XDPOOL_FREE_PROVIDER,
-            displayName: EXTRA_LANE_NAMES.free,
-            extraRows: () => freeCatalog.current(),
-          }),
         } as const
         // The disposer the host hands back from `registerAdapter` also carries
         // `replace(routes)`. That is the ONLY way a plugin can make the host
@@ -1724,7 +1697,6 @@ function canonicalJson(value: unknown): string {
         let releaseAdapterCn: AdapterHandle | undefined
         let releaseAdapterGlobal: AdapterHandle | undefined
         let releaseAdapterAggregate: AdapterHandle | undefined
-        let releaseAdapterFree: AdapterHandle | undefined
         let releaseDirectory: (() => void) | undefined
         // Adapters first, in a try of their own, and ONLY THEN the directory.
         //
@@ -1750,15 +1722,6 @@ function canonicalJson(value: unknown): string {
             [XDPOOL_AGGREGATE_PROVIDER],
             adaptersByRegion.aggregate.adapter,
           )
-          // The free lane registers in the SAME try as the three pool adapters,
-          // deliberately. It is the same kind of thing — a pi-ai provider over
-          // the same loopback shim — so if it cannot be created the plugin is no
-          // longer in a state it should advertise at all, and letting three
-          // through would only hide that.
-          releaseAdapterFree = ctx.llm.registerAdapter(
-            [XDPOOL_FREE_PROVIDER],
-            adaptersByRegion.free.adapter,
-          )
         } catch (error: unknown) {
           // An adapter that cannot be created is not survivable — the picker
           // would advertise a provider with nothing behind it — so this is the
@@ -1768,7 +1731,6 @@ function canonicalJson(value: unknown): string {
           releaseAdapterCn?.()
           releaseAdapterGlobal?.()
           releaseAdapterAggregate?.()
-          releaseAdapterFree?.()
           return
         }
         try {
@@ -1801,17 +1763,6 @@ function canonicalJson(value: unknown): string {
               settingsPath: [],
               declared: false,
             },
-            {
-              // Grouped so the picker shows the免密 lane beside the pool rather
-              // than folding it in: the rows come from a different gateway and
-              // spend a different quota, and a user who cannot tell them apart
-              // cannot tell which one answered.
-              provider: XDPOOL_FREE_PROVIDER,
-              displayName: EXTRA_LANE_NAMES.free,
-              settingsNs: XDPOOL_SETTINGS_NS,
-              settingsPath: [],
-              declared: false,
-            },
           ])
         } catch (error: unknown) {
           // Recoverable on purpose. The adapters above are already live and the
@@ -1838,7 +1789,6 @@ function canonicalJson(value: unknown): string {
           adaptersByRegion.cn.invalidate()
           adaptersByRegion.global.invalidate()
           adaptersByRegion.aggregate.invalidate()
-          adaptersByRegion.free.invalidate()
           // `invalidate()` only swaps the adapter's own snapshot. The host keeps
           // a second snapshot keyed by the identity of our `profiles` map, and
           // it is the host's copy the picker reads — so rebuilding here without
@@ -1850,7 +1800,6 @@ function canonicalJson(value: unknown): string {
             [releaseAdapterCn, [POOL_PROVIDER_BY_REGION.cn]],
             [releaseAdapterGlobal, [POOL_PROVIDER_BY_REGION.global]],
             [releaseAdapterAggregate, [XDPOOL_AGGREGATE_PROVIDER]],
-            [releaseAdapterFree, [XDPOOL_FREE_PROVIDER]],
           ] as const) {
             if (handle === undefined) continue
             try {
@@ -1870,19 +1819,11 @@ function canonicalJson(value: unknown): string {
         void aggregateCatalog.onChange(() => {
           invalidateCatalog()
         })
-        // The same for the free lane: its roster is read live, so a
-        // listing that lands after startup has to be able to move the picker
-        // without a restart. This is also what makes a failed refresh honest —
-        // the rows are kept, so the picker keeps them.
-        void freeCatalog.onChange(() => {
-          invalidateCatalog()
-        })
         /** Release everything the providers registered, once. */
         const releaseProviders = (): void => {
           releaseAdapterCn?.()
           releaseAdapterGlobal?.()
           releaseAdapterAggregate?.()
-          releaseAdapterFree?.()
           releaseDirectory?.()
         }
         try {
@@ -1897,18 +1838,6 @@ function canonicalJson(value: unknown): string {
         // from its own catalog — the two gateways do not advertise the same
         // roster, so one shared list would serve the wrong models to one of them.
         ctx.llm.registerModelDiscovery(XDPOOL_SETTINGS_NS, async (request: { provider?: string }) => {
-          // The free lane's mapper: the picker asks for a flat shape and the
-          // roster already carries the fields it wants. Narrowed rather than cast
-          // so a new field on the row has to be accounted for.
-          if (request.provider === XDPOOL_FREE_PROVIDER) {
-            return freeCatalog.current().map(row => ({
-              id: row.modelId,
-              name: row.name,
-              contextWindow: row.contextWindow,
-              maxTokens: row.maxOutput,
-              inputModalities: row.vision ? ['text', 'image'] : ['text'],
-            }))
-          }
           if (request.provider === XDPOOL_AGGREGATE_PROVIDER) {
             // Both row kinds answer here: a chain is a route the user can pick
             // directly, so hiding it from the picker would make it reachable only
@@ -1934,29 +1863,10 @@ function canonicalJson(value: unknown): string {
           }))
         })
         ctx.logger.info?.(
-          `dsh-xdpool: providers registered at cn=${shims.cn.baseUrl()} global=${shims.global.baseUrl()} aggregate=${aggregateCatalog.current().length} free=${freeCatalog.current().length} model(s)`,
+          `dsh-xdpool: providers registered at cn=${shims.cn.baseUrl()} global=${shims.global.baseUrl()} aggregate=${aggregateCatalog.current().length} model(s)`,
         )
         recordStartupNote(
-          `providers registered cn=${shims.cn.baseUrl()} global=${shims.global.baseUrl()} aggregate=${aggregateCatalog.current().length} free=${freeCatalog.current().length} model(s) directory=${releaseDirectory === undefined ? 'rejected' : 'mounted'}`,
-        )
-        // Refresh the live roster now that the picker can be rebuilt, so a listing
-        // that lands replaces the static fallback without a restart.
-        //
-        // It needs its own rejection handler, for the reason the catalog seed
-        // below documents: the host installs `installFailLoud`, which turns an
-        // unhandled rejection into `exit(1)`. A free gateway that is simply
-        // unreachable from this network must cost the免密 rows their freshness,
-        // never the whole desktop.
-        void freeCatalog.refresh().then(
-          rows => {
-            invalidateCatalog()
-            ctx.logger.info?.(`dsh-xdpool: free lane serves ${rows.length} model(s)`)
-            recordStartupNote(`free lane ready rows=${rows.length} live=${freeCatalog.updatedAt() !== undefined}`)
-          },
-          (error: unknown) => {
-            ctx.logger.warn('dsh-xdpool: free lane listing failed', error)
-            recordStartupNote(`free lane listing failed: ${describeError(error)}`)
-          },
+          `providers registered cn=${shims.cn.baseUrl()} global=${shims.global.baseUrl()} aggregate=${aggregateCatalog.current().length} model(s) directory=${releaseDirectory === undefined ? 'rejected' : 'mounted'}`,
         )
       } catch (error: unknown) {
         ctx.logger.error('dsh-xdpool: provider registration failed', error)
