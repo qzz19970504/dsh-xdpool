@@ -29,6 +29,7 @@
 
 import { useEffect, useRef, useState, type ReactElement } from 'react'
 import { BrandTile } from './brand-tile.tsx'
+import { CreditFooter } from './CreditFooter.tsx'
 import { channelIcon, channelInitials } from './channel-icons.ts'
 import { ModelFactsRow } from './model-facts-row.tsx'
 import { modelFactsFor, formatModelCapacity, type ModelFacts } from './model-facts.ts'
@@ -1089,6 +1090,23 @@ export function ChannelPoolSection({ t }: { readonly t?: Translate | undefined }
           </button>
         </div>
       </div>
+      {/*
+        The whole page's answer to "how much is left", in one line. Built from
+        the balances the cards above already hold, so it costs no extra round
+        trip: the same `credits.balances` answer that fills one card's numbers
+        row is what this strip sums per channel. It is deliberately the LAST
+        thing on the page — each card already carries its own figure, and a
+        summary that interrupts the list would be read before the list.
+      */}
+      <CreditFooter
+        channels={entries.map(entry => entry.channel)}
+        balances={Object.fromEntries(entries.map(entry => [
+          entry.channel.id,
+          entry.balances.map(row => balanceAmount(row.balance)),
+        ]))}
+        pending={entries.some(entry => entry.balancePending)}
+        t={t}
+      />
     </section>
   )
 }

@@ -516,6 +516,26 @@ export const POOL_CARD_CSS = `
 .dsm-xdpool-cpool-card,.dsm-xdpool-cpool-card:hover,.dsm-xdpool-cpool-fold,.dsm-xdpool-cpool-fold:active:not(:disabled){transition:none;transform:none}
 .dsm-xdpool-cpool-card:hover .dsm-xdpool-tile{transition:none;transform:none}
 }
+/* ── The credit footer under the whole pool page ──
+   One line, one chip per channel that actually reported a balance. Sticky at
+   the bottom of the scroll container rather than fixed to the viewport: the
+   page is long enough that a footer in flow is never seen, but a viewport-fixed
+   one would sit on top of the "Reload" button that lives at the end of the
+   pool card. Semi-transparent with a blur so the cards behind it stay readable
+   instead of being cut off by a solid slab. */
+.dsm-xdpool-credit-footer{position:sticky;bottom:0;z-index:2;display:flex;flex-wrap:wrap;align-items:center;gap:6px 10px;margin-top:4px;padding:8px 12px;border:1px solid var(--dsw-alias-border-l2,#36373b);border-radius:11px;background:color-mix(in srgb, var(--dsw-alias-bg-layer-2,#22242a) 88%, transparent);backdrop-filter:blur(10px);box-shadow:0 -2px 14px rgb(0 0 0 / 14%), inset 0 1px 0 rgb(255 255 255 / 5%)}
+.dsm-xdpool-credit-footer-label{flex:none;font-size:11px;font-weight:600;letter-spacing:.3px;text-transform:uppercase;color:var(--dsw-alias-label-tertiary,#9aa0a8)}
+.dsm-xdpool-credit-footer-pending{font-size:12px;color:var(--dsw-alias-label-tertiary,#9aa0a8)}
+/* One channel. The name is quiet and the number is loud — the footer answers
+   "how much", and the vendor is only there to say whose number it is. */
+.dsm-xdpool-credit-footer-chip{display:inline-flex;align-items:baseline;gap:5px;padding:2px 9px;border-radius:9px;border:1px solid color-mix(in srgb, var(--dsw-alias-border-l2,#36373b) 80%, transparent);background:color-mix(in srgb, var(--dsw-alias-bg-layer-1,#191a1e) 70%, transparent)}
+.dsm-xdpool-credit-footer-name{font-size:11px;line-height:16px;color:var(--dsw-alias-label-tertiary,#9aa0a8)}
+.dsm-xdpool-credit-footer-amount{font-size:12px;font-weight:650;line-height:17px;color:var(--dsw-alias-label-primary,#f2f3f5);font-variant-numeric:tabular-nums}
+.dsm-xdpool-credit-footer-unit{font-size:10px;line-height:15px;color:var(--dsw-alias-label-tertiary,#9aa0a8)}
+/* A channel that answered zero is still a fact — the chip stays, in a muted
+   tone, so the reader can tell it apart from one that never answered at all
+   (which is absent from the strip entirely). */
+.dsm-xdpool-credit-footer-chip[data-zero="true"] .dsm-xdpool-credit-footer-amount{color:var(--dsw-alias-label-tertiary,#9aa0a8)}
 /* One lane. The colour variables are injected inline by regionCardStyle(); the
    fallbacks here keep the card legible if that call is ever dropped.
 
