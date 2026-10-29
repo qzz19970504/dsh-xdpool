@@ -29,6 +29,7 @@
 
 import { useEffect, useRef, useState, type ReactElement } from 'react'
 import { BrandTile } from './brand-tile.tsx'
+import { CreditFooter } from './CreditFooter.tsx'
 import { channelIcon, channelInitials } from './channel-icons.ts'
 import { ModelFactsRow } from './model-facts-row.tsx'
 import { modelFactsFor, formatModelCapacity, type ModelFacts } from './model-facts.ts'
@@ -180,6 +181,13 @@ export function ChannelPoolSection({ t }: { readonly t?: Translate | undefined }
   const [entries, setEntries] = useState<readonly ChannelEntry[]>(() => channelEntriesMemoryCache)
   const [error, setError] = useState<string | undefined>(undefined)
   const [notice, setNotice] = useState<string | undefined>(undefined)
+  /**
+   * True once the retries are spent with no cards.
+   *
+   * "Loaded and empty" is not "loading": a cold mount and a pool with no scan
+   * accounts both render zero cards, and only one of them is still working.
+   */
+  const [settled, setSettled] = useState(false)
   /** provider → the open list, or `undefined` for a card with both folded. */
   const [folds, setFolds] = useState<ReadonlyMap<string, Fold | undefined>>(new Map())
   /** provider → the set of model ids the user has ticked. */
@@ -191,7 +199,17 @@ export function ChannelPoolSection({ t }: { readonly t?: Translate | undefined }
   const entriesRef = useRef(entries)
   entriesRef.current = entries
   const mountedRef = useRef(true)
-  useEffect(() => () => { mountedRef.current = false }, [])
+  useEffect(() => {
+    // Re-arm on every setup. StrictMode mounts every effect as
+    // setup → cleanup → setup; a ref that is only ever cleared in the cleanup
+    // stays false for the rest of the session, and every state write a finished
+    // load makes is then dropped — which renders as a permanent "loading" line
+    // with no error.
+    mountedRef.current = true
+    return () => {
+      mountedRef.current = false
+    }
+  }, [])
 
   const markBusy = (provider: string, on: boolean): void => {
     setBusy(previous => {
@@ -218,47 +236,32 @@ export function ChannelPoolSection({ t }: { readonly t?: Translate | undefined }
       const scanProviders = channels
         .map(channel => channel.id)
         .filter(id => (statuses.get(id)?.accountsTotal ?? 0) > 0)
-      // Facts are fetched AFTER the model lists below, not before: the host's
-      // own listing is gated per provider, and a gated channel answers "no
-      // models" even while its card shows nine. The ids this page just rendered
-      // are the authoritative set, so they are handed back to the host as a
-      // hint — see `PoolWebChannelModelsRequest.ids`.
+      // Phase 1 waits for ONE call per channel: its account rows. Everything
+      // else — model catalogues, balances, check-in state, host facts — is
+      // enrichment that runs after the cards exist.
+      //
+      // `model.list` must NOT be here. For most channels it is an in-memory
+      // read, but cline's resolves its remote catalogue (models.dev plus the
+      // vendor endpoint, 20 s timeout each) and was measured still in flight at
+      // 24 s; awaiting it meant no card rendered at all for over a minute,
+      // which reads exactly like "this page never loads".
       const perProvider = await Promise.all(scanProviders.map(async provider => {
         const wantBalances = channels.find(channel => channel.id === provider)?.credits !== undefined
-        // The calls are independent: a channel whose catalogue cannot be
-        // listed still has accounts worth showing, so one failure must not
-        // blank the other half of the card.
-        const accountsPromise = callPack('account.list', { provider })
-        const modelsPromise = callPack('model.list', { provider })
-        // In phase 1 we only await accounts and models (local in-memory queries in pack.js),
-        // so cards land on screen immediately without being blocked by network requests.
-        const [accounts, models] = await Promise.all([
-          accountsPromise.catch(() => refused('account.list failed')),
-          modelsPromise.catch(() => refused('model.list failed')),
-        ])
-        // `model.list` answers with a FLAT array for the one provider it was
-        // asked about (`{models: [...]}`), not a provider→rows map, so it is
-        // read with modelsFrom — reading it as a map found no key for this
-        // provider and rendered an empty list under a plausible "no models
-        // published" line.
-        const modelRows = modelsFrom(models.value)
-        const modelEmptyBecauseRefused = modelRows.length === 0 && models.ok !== true
+        const accounts = await callPack('account.list', { provider })
+          .catch(() => refused('account.list failed'))
         return [
           provider,
           {
             accounts: dedupeAccounts(accountsFrom(accounts)),
-            // Sorted at read time so the order survives every re-load: the pack
-            // returns each vendor's own chronology, which is not the order a
-            // reader answers "which one do I pick?" in.
-            models: sortChannelModels(modelRows),
+            // Model rows are filled by Phase 2: the card is already useful
+            // without them, and one slow catalogue must not hold the others.
+            models: [] as readonly ChannelModel[],
             facts: new Map<string, PoolWebChannelModel>(),
             balances: [] as readonly ChannelBalance[],
             statuses: [] as readonly ChannelCreditStatus[],
             balancePending: wantBalances,
             balanceError: undefined as string | undefined,
-            modelError: modelEmptyBecauseRefused
-              ? (models.error?.message ?? 'model.list refused')
-              : undefined,
+            modelError: undefined as string | undefined,
           },
         ] as const
       }))
@@ -274,8 +277,9 @@ export function ChannelPoolSection({ t }: { readonly t?: Translate | undefined }
       if (!mountedRef.current) return
 
       // Two phases: Phase 1 renders all available channel cards immediately.
-      // Balances, credit statuses and fact descriptors are enriched per provider
-      // asynchronously in Phase 2 so slow remote requests cannot gate the cards.
+      // Balances, credit statuses, model catalogues and fact descriptors are
+      // enriched per provider asynchronously in Phase 2 so slow remote requests
+      // cannot gate the cards.
       channelEntriesMemoryCache = next
       setEntries(next)
       setError(undefined)
@@ -301,6 +305,42 @@ export function ChannelPoolSection({ t }: { readonly t?: Translate | undefined }
 
       for (const entry of next) {
         const provider = entry.channel.id
+        // Model catalogue first, because the host facts below are keyed by the
+        // ids it returns. `model.list` answers a FLAT array for the one
+        // provider it was asked about (`{models: [...]}`), not a provider→rows
+        // map, so it is read with modelsFrom — reading it as a map found no key
+        // for this provider and rendered an empty list under a plausible
+        // "no models published" line. A refusal is surfaced on the card rather
+        // than folded into "no models", so a host without the `llm` service
+        // does not look like an empty catalogue.
+        void callPack('model.list', { provider })
+          .catch(() => refused('model.list failed'))
+          .then(answer => {
+            // Sorted at read time so the order survives every re-load: the pack
+            // returns each vendor's own chronology, which is not the order a
+            // reader answers "which one do I pick?" in.
+            const modelRows = sortChannelModels(modelsFrom(answer.value))
+            updateProvider(provider, {
+              models: modelRows,
+              modelError: modelRows.length === 0 && answer.ok !== true
+                ? (answer.error?.message ?? 'model.list refused')
+                : undefined,
+            })
+            const ids = modelRows.map(model => model.id)
+            // Facts are fetched AFTER the model list, not before: the host's
+            // own listing is gated per provider, and a gated channel answers
+            // "no models" even while its card shows nine. The ids the card just
+            // got are the authoritative set, so they are handed back to the
+            // host as a hint — see `PoolWebChannelModelsRequest.ids`.
+            void fetchChannelModels([provider], ids.length > 0 ? { [provider]: ids } : {})
+              .catch((): ReadonlyMap<string, readonly PoolWebChannelModel[]> => new Map())
+              .then(facts => {
+                if (!facts.has(provider)) return
+                updateProvider(provider, {
+                  facts: new Map((facts.get(provider) ?? []).map(model => [model.id, model])),
+                })
+              })
+          })
         if (entry.channel.credits !== undefined) {
           void callPack('credits.balances', { provider })
             .catch(() => refused('credits.balances failed'))
@@ -324,15 +364,6 @@ export function ChannelPoolSection({ t }: { readonly t?: Translate | undefined }
               })
           }
         }
-        const ids = entry.models.map(model => model.id)
-        void fetchChannelModels([provider], ids.length > 0 ? { [provider]: ids } : {})
-          .catch((): ReadonlyMap<string, readonly PoolWebChannelModel[]> => new Map())
-          .then(facts => {
-            if (!facts.has(provider)) return
-            updateProvider(provider, {
-              facts: new Map((facts.get(provider) ?? []).map(model => [model.id, model])),
-            })
-          })
       }
     } catch (cause) {
       if (!mountedRef.current) return
@@ -351,7 +382,10 @@ export function ChannelPoolSection({ t }: { readonly t?: Translate | undefined }
     await load()
     if (!mountedRef.current) return
     if (entriesRef.current.length > 0) return
-    if (attempt >= LOAD_RETRIES) return
+    if (attempt >= LOAD_RETRIES) {
+      setSettled(true)
+      return
+    }
     window.setTimeout(() => { if (mountedRef.current) void loadWithRetry(attempt + 1) }, RETRY_INTERVAL_MS)
   }
 
@@ -610,10 +644,18 @@ export function ChannelPoolSection({ t }: { readonly t?: Translate | undefined }
   // "add an account on the login page" only repeats the nav row the reader
   // just clicked. Render nothing rather than a placeholder that reads like a
   // failure. A load ERROR still speaks, because that one is a real problem.
+  //
+  // The one thing an empty page must not do is keep claiming to load after the
+  // retries are spent: that is what turned a slow first paint into "the page is
+  // permanently stuck", and it is indistinguishable from a hung mount.
   if (entries.length === 0 && error === undefined) {
     return (
       <section className="dsm-xdpool-cpool" aria-label={t?.('channelpool.title') ?? 'Channels'}>
-        <p className="dsm-xdpool-note">{t?.('chan.pending') ?? '扫码渠道加载中…'}</p>
+        <p className="dsm-xdpool-note">
+          {settled
+            ? (t?.('channelpool.empty') ?? 'No channel accounts yet — add one on the scan-login page and the channel shows up here.')
+            : (t?.('chan.pending') ?? '扫码渠道加载中…')}
+        </p>
       </section>
     )
   }
@@ -1048,6 +1090,23 @@ export function ChannelPoolSection({ t }: { readonly t?: Translate | undefined }
           </button>
         </div>
       </div>
+      {/*
+        The whole page's answer to "how much is left", in one line. Built from
+        the balances the cards above already hold, so it costs no extra round
+        trip: the same `credits.balances` answer that fills one card's numbers
+        row is what this strip sums per channel. It is deliberately the LAST
+        thing on the page — each card already carries its own figure, and a
+        summary that interrupts the list would be read before the list.
+      */}
+      <CreditFooter
+        channels={entries.map(entry => entry.channel)}
+        balances={Object.fromEntries(entries.map(entry => [
+          entry.channel.id,
+          entry.balances.map(row => balanceAmount(row.balance)),
+        ]))}
+        pending={entries.some(entry => entry.balancePending)}
+        t={t}
+      />
     </section>
   )
 }
